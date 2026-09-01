@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudIntel Non-Prod AWS Account Deployment & Infrastructure Specification'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'nonprod'
+    AllowedValues: ['nonprod', 'staging', 'prod']
+    Description: 'Target environment name.'
+
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+    Default: 'gsk_your_groq_api_key_here'
+    Description: 'Groq Cloud API Key for Non-Prod LLM inference.'
+
+  AppRunnerInstanceCpu:
+    Type: String
+    Default: '1024'
+    AllowedValues: ['1024', '2048', '4096']
+    Description: 'vCPU allocation for App Runner container.'
+
+  AppRunnerInstanceMemory:
+    Type: String
+    Default: '2048'
+    AllowedValues: ['2048', '3072', '4096', '6144', '8192']
+    Description: 'Memory (MB) allocation for App Runner container.'
+
+Resources:
+  # 1. ECR Repository for Container Images
+  CloudIntelECRRepository:
+    Type: 'AWS::ECR::Repository'
+    Properties:
+      RepositoryName: 'cloudintel-nonprod-app'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: 'AES256'
+
+  # 2. IAM Role for CloudIntel App Execution (Least Privilege Non-Prod)
+  CloudIntelNonProdRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'CloudIntel-NonProd-ExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - build.apprunner.amazonaws.com
+                - tasks.ecs-tasks.amazonaws.com
+                - apprunner.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess'
+      Policies:
+        - PolicyName: 'CloudIntelNonProdReadAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ce:GetCostAndUsage'
+                  - 'ce:GetDimensionValues'
+                  - 'cloudwatch:GetMetricData'
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'ecs:ListClusters'
+                  - 'ecs:ListTasks'
+                  - 'ecs:DescribeTasks'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'lambda:ListFunctions'
+                  - 'lambda:GetFunction'
+                  - 's3:ListAllMyBuckets'
+                  - 's3:GetBucketEncryption'
+                  - 's3:GetBucketLifecycleConfiguration'
+                  - 'servicecatalog:ListPortfolios'
+                  - 'servicecatalog:DescribePortfolio'
+                Resource: '*'
+
+  # 3. AWS App Runner Service (Streamlit App Hosting)
+  CloudIntelAppRunnerService:
+    Type: 'AWS::AppRunner::Service'
+    Properties:
+      ServiceName: 'cloudintel-nonprod-portal'
+      SourceConfiguration:
+        AutoDeploymentsEnabled: true
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt CloudIntelNonProdRole.Arn
+        ImageRepository:
+          ImageIdentifier: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/cloudintel-nonprod-app:latest'
+          ImageConfiguration:
+            Port: '8501'
+            RuntimeEnvironmentVariables:
+              - Name: 'APP_ENV'
+                Value: !Ref Environment
+              - Name: 'GROQ_API_KEY'
+                Value: !Ref GroqApiKey
+              - Name: 'GUARDRAILS_MODE'
+                Value: 'ENFORCE'
+          ImageRepositoryType: 'ECR'
+      InstanceConfiguration:
+        Cpu: !Ref AppRunnerInstanceCpu
+        Memory: !Ref AppRunnerInstanceMemory
+        InstanceRoleArn: !GetAtt CloudIntelNonProdRole.Arn
+
+  # 4. AWS Service Catalog Portfolio Integration
+  CloudIntelServiceCatalogPortfolio:
+    Type: 'AWS::ServiceCatalog::Portfolio'
+    Properties:
+      DisplayName: 'CloudIntel-NonProd-FinOps-Remediations'
+      Description: 'Portfolio containing guardrail-vetted CloudFormation remediation templates for Non-Prod AWS Account'
+      ProviderName: 'CloudIntel FinOps Team'
+
+Outputs:
+  ECRRepositoryUri:
+    Description: 'URI of ECR Repository for pushing Docker images'
+    Value: !GetAtt CloudIntelECRRepository.RepositoryUri
+  
+  AppRunnerServiceUrl:
+    Description: 'Public / Internal URL of Non-Prod CloudIntel Web Portal'
+    Value: !GetAtt CloudIntelAppRunnerService.ServiceUrl
+
+  ServiceCatalogPortfolioId:
+    Description: 'AWS Service Catalog Portfolio ID'
+    Value: !Ref CloudIntelServiceCatalogPortfolio

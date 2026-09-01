@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Env / secrets
+.env
+config/accounts.json
+
+# Data & Database
+data/processed/*.duckdb
+data/processed/*.duckdb.wal
+data/raw/*
+
+# IDE / Logs
+.vscode/
+.idea/
+*.log
