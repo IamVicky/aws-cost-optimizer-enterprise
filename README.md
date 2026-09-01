@@ -1,5 +1,8 @@
 # CloudIntel — Enterprise AI FinOps Platform
 
+[![Enterprise Repo](https://img.shields.io/badge/GitHub-aws--cost--optimizer--enterprise-blue?logo=github)](https://github.com/IamVicky/aws-cost-optimizer-enterprise)
+[![Original POC Repo](https://img.shields.io/badge/GitHub-ai--aws--cost--aws--cost--opti-lightgrey?logo=github)](https://github.com/IamVicky/ai-aws-cost-aws-cost-opti)
+
 CloudIntel is an enterprise-grade AI FinOps intelligence platform designed to eliminate cloud waste across decentralized Business Units (BUs) while strictly enforcing financial institution security, KMS encryption mandates, and compliance guardrails.
 
 ---
