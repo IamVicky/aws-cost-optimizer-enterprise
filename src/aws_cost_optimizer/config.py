@@ -12,6 +12,7 @@ DATA_PROCESSED_DIR = os.getenv("DATA_PROCESSED_DIR", os.path.join(PACKAGE_ROOT, 
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", os.path.join(DATA_PROCESSED_DIR, "cloudintel.duckdb"))
 
 ACCOUNTS_CONFIG_PATH = os.getenv("ACCOUNTS_CONFIG_PATH", os.path.join(PACKAGE_ROOT, "..", "..", "config", "accounts.json"))
+SERVICES_CONFIG_DIR = os.getenv("SERVICES_CONFIG_DIR", os.path.join(PACKAGE_ROOT, "..", "..", "config", "services"))
 
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")

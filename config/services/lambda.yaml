@@ -1,0 +1,30 @@
+service_type: AWS-Lambda
+table: lambda_metrics
+resource_id_template: "{function_arn}"
+fetch_adapter: lambda
+raw_fallback_file: lambda_metrics.json
+
+schema:
+  - {name: function_arn, type: VARCHAR, primary_key: true}
+  - {name: function_name, type: VARCHAR}
+  - {name: business_unit, type: VARCHAR}
+  - {name: memory_allocated_mb, type: INTEGER}
+  - {name: memory_max_used_mb, type: INTEGER}
+  - {name: avg_duration_ms, type: DOUBLE}
+  - {name: invocations_count, type: INTEGER}
+  - {name: timeout_seconds, type: INTEGER}
+
+waste_rule:
+  recommendation_prefix: REC_LAMBDA
+  condition: "memory_allocated_mb >= (memory_max_used_mb * 2)"
+  savings_formula: "round((memory_allocated_mb - memory_max_used_mb) * 0.005, 2)"
+  derived_fields:
+    suggested_memory: "max(128, memory_max_used_mb * 2)"
+  fix_template: "Optimize Lambda function {function_name} memory allocation from {memory_allocated_mb} MB to {suggested_memory} MB based on peak recorded memory of {memory_max_used_mb} MB."
+
+guardrail_rules:
+  - type: forbidden_patterns
+    match_keywords: ["LAMBDA", "SERVERLESS"]
+    patterns: ["DISABLE TELEMETRY", "DISABLE XRAY", "DISABLE X-RAY", "MEMORY BELOW 128"]
+    compliance_status: REJECTED_LAMBDA_TELEMETRY_BOUNDS
+    rule_id: RULE_LAMBDA_BOUNDS

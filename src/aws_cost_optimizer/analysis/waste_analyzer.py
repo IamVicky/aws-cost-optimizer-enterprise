@@ -3,86 +3,59 @@ import pandas as pd
 
 from aws_cost_optimizer.config import DUCKDB_PATH
 from aws_cost_optimizer.guardrails import BankingGuardrailsEngine
+from aws_cost_optimizer.service_registry import load_services
+from aws_cost_optimizer.expr import safe_eval
 
 
 class WasteAnalyzer:
     def __init__(self, db_path: str = DUCKDB_PATH):
         self.db_path = db_path
         self.guardrails = BankingGuardrailsEngine()
+        self.services = load_services()
+
+    def _build_candidate(self, service_def, row: dict, rec_counter: int) -> dict:
+        row = dict(row)
+        for derived_name, derived_expr in service_def.waste_rule.derived_fields.items():
+            row[derived_name] = safe_eval(derived_expr, row)
+
+        est_savings = safe_eval(service_def.waste_rule.savings_formula, row)
+        proposed_fix = service_def.waste_rule.fix_template.format(**row)
+        resource_id = service_def.resource_id_template.format(**row)
+
+        return {
+            "recommendation_id": f"{service_def.waste_rule.recommendation_prefix}_{rec_counter:03d}",
+            "resource_id": resource_id,
+            "service_type": service_def.service_type,
+            "business_unit": row["business_unit"],
+            "estimated_monthly_savings": est_savings,
+            "proposed_fix_description": proposed_fix,
+        }
 
     def run_analysis(self) -> list:
-        """Autonomous waste scanner executing multi-dimensional analytical queries."""
+        """Autonomous waste scanner: for every service defined in
+        config/services/*.yaml, scans its metrics table for the configured
+        waste condition and builds a recommendation candidate."""
         con = duckdb.connect(self.db_path)
-        candidates = []
+        candidates = []  # list of (candidate_dict, source_row_dict)
         rec_counter = 1
 
         print("[Analyzer] Scanning cloud resources for waste patterns...")
 
-        # 1. Analyze ECS Task Oversizing
-        df_ecs = con.execute("""
-            SELECT task_arn, cluster_name, service_name, business_unit, cpu_reserved, memory_reserved, cpu_utilization_max, memory_utilization_max
-            FROM ecs_task_metrics
-            WHERE cpu_utilization_max < 15.0 OR memory_utilization_max < 15.0;
-        """).fetchdf()
+        for service_def in self.services.values():
+            df = con.execute(f"SELECT * FROM {service_def.table};").fetchdf()
 
-        for idx, row in df_ecs.iterrows():
-            est_savings = round((row["cpu_reserved"] / 1024.0) * 35.0, 2)
-            proposed_fix = f"Downsize ECS task definition {row['service_name']} CPU from {row['cpu_reserved']} to {max(256, int(row['cpu_reserved']/4))} units and memory from {row['memory_reserved']} to {max(512, int(row['memory_reserved']/4))} MB while preserving security sidecars."
-            candidates.append({
-                "recommendation_id": f"REC_ECS_{rec_counter:03d}",
-                "resource_id": row["task_arn"],
-                "service_type": "ECS-EC2",
-                "business_unit": row["business_unit"],
-                "estimated_monthly_savings": est_savings,
-                "proposed_fix_description": proposed_fix
-            })
-            rec_counter += 1
-
-        # 2. Analyze Lambda Memory Over-allocation
-        df_lambda = con.execute("""
-            SELECT function_arn, function_name, business_unit, memory_allocated_mb, memory_max_used_mb, invocations_count
-            FROM lambda_metrics
-            WHERE memory_allocated_mb >= (memory_max_used_mb * 2);
-        """).fetchdf()
-
-        for idx, row in df_lambda.iterrows():
-            est_savings = round((row["memory_allocated_mb"] - row["memory_max_used_mb"]) * 0.005, 2)
-            proposed_fix = f"Optimize Lambda function {row['function_name']} memory allocation from {row['memory_allocated_mb']} MB to {max(128, row['memory_max_used_mb'] * 2)} MB based on peak recorded memory of {row['memory_max_used_mb']} MB."
-            candidates.append({
-                "recommendation_id": f"REC_LAMBDA_{rec_counter:03d}",
-                "resource_id": row["function_arn"],
-                "service_type": "AWS-Lambda",
-                "business_unit": row["business_unit"],
-                "estimated_monthly_savings": est_savings,
-                "proposed_fix_description": proposed_fix
-            })
-            rec_counter += 1
-
-        # 3. Analyze S3 Storage Lifecycle Opportunities
-        df_s3 = con.execute("""
-            SELECT bucket_name, business_unit, kms_key_arn, storage_bytes_standard, oldest_object_age_days, has_lifecycle_policy
-            FROM s3_storage_metrics
-            WHERE has_lifecycle_policy = FALSE AND oldest_object_age_days > 90;
-        """).fetchdf()
-
-        for idx, row in df_s3.iterrows():
-            tb_stored = row["storage_bytes_standard"] / 1e12
-            est_savings = round(tb_stored * 15.0, 2)
-            proposed_fix = f"Add AWS CloudFormation S3 Lifecycle Rule to transition objects older than 90 days in bucket '{row['bucket_name']}' to Glacier, preserving SSE-KMS encryption with KMS Key '{row['kms_key_arn']}'."
-            candidates.append({
-                "recommendation_id": f"REC_S3_{rec_counter:03d}",
-                "resource_id": f"arn:aws:s3:::{row['bucket_name']}",
-                "service_type": "S3-Storage",
-                "business_unit": row["business_unit"],
-                "estimated_monthly_savings": est_savings,
-                "proposed_fix_description": proposed_fix
-            })
-            rec_counter += 1
+            for _, row in df.iterrows():
+                row_dict = row.to_dict()
+                if not safe_eval(service_def.waste_rule.condition, row_dict):
+                    continue
+                candidate = self._build_candidate(service_def, row_dict, rec_counter)
+                candidates.append((candidate, row_dict))
+                rec_counter += 1
 
         # Evaluate all candidates via Banking Guardrails Engine
         processed_recs = []
-        for c in candidates:
-            evaluated = self.guardrails.evaluate_recommendation(c)
+        for c, row_dict in candidates:
+            evaluated = self.guardrails.evaluate_recommendation(c, row=row_dict)
             processed_recs.append(evaluated)
 
         # Store in candidate_recommendations table

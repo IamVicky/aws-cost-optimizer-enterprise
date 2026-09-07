@@ -6,10 +6,21 @@ import pandas as pd
 
 from aws_cost_optimizer.config import DATA_RAW_DIR, DATA_PROCESSED_DIR, DUCKDB_PATH
 from aws_cost_optimizer.connectors import AWSNonProdConnector
+from aws_cost_optimizer.service_registry import load_services
 
 
-def init_db(con):
-    """Initializes DuckDB schema tables for cost reports and resource metrics."""
+def _column_ddl(field) -> str:
+    ddl = f"{field.name} {field.type}"
+    if field.primary_key:
+        ddl += " PRIMARY KEY"
+    return ddl
+
+
+def init_db(con, services: dict = None):
+    """Initializes DuckDB schema tables for cost reports, per-service metrics
+    (driven by config/services/*.yaml), and recommendations."""
+    services = services if services is not None else load_services()
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS raw_cost_reports (
             line_item_id VARCHAR PRIMARY KEY,
@@ -22,47 +33,13 @@ def init_db(con):
         );
     """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS ecs_task_metrics (
-            task_arn VARCHAR PRIMARY KEY,
-            cluster_name VARCHAR,
-            service_name VARCHAR,
-            business_unit VARCHAR,
-            cpu_reserved INTEGER,
-            memory_reserved INTEGER,
-            cpu_utilization_max DOUBLE,
-            memory_utilization_max DOUBLE,
-            launch_type VARCHAR,
-            has_security_sidecar BOOLEAN
-        );
-    """)
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS lambda_metrics (
-            function_arn VARCHAR PRIMARY KEY,
-            function_name VARCHAR,
-            business_unit VARCHAR,
-            memory_allocated_mb INTEGER,
-            memory_max_used_mb INTEGER,
-            avg_duration_ms DOUBLE,
-            invocations_count INTEGER,
-            timeout_seconds INTEGER
-        );
-    """)
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS s3_storage_metrics (
-            bucket_name VARCHAR PRIMARY KEY,
-            business_unit VARCHAR,
-            kms_key_arn VARCHAR,
-            is_kms_encrypted BOOLEAN,
-            storage_bytes_standard DOUBLE,
-            storage_bytes_glacier DOUBLE,
-            object_count INTEGER,
-            has_lifecycle_policy BOOLEAN,
-            oldest_object_age_days INTEGER
-        );
-    """)
+    for service_def in services.values():
+        columns_ddl = ",\n            ".join(_column_ddl(f) for f in service_def.schema_fields)
+        con.execute(f"""
+            CREATE TABLE IF NOT EXISTS {service_def.table} (
+            {columns_ddl}
+            );
+        """)
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS candidate_recommendations (
@@ -78,11 +55,28 @@ def init_db(con):
     """)
 
 
+def _load_service_dataframe(service_def, aws_conn, aws_active: bool) -> pd.DataFrame:
+    """Fetches live data for a service if AWS is active, else falls back to
+    its local raw JSON fixture. Mirrors the previous per-service fetch/fallback
+    logic, but driven by the service's fetch_adapter/raw_fallback_file config."""
+    live_records = aws_conn.fetch(service_def) if aws_active else []
+    if live_records:
+        return pd.DataFrame(live_records)
+
+    fallback_path = os.path.join(DATA_RAW_DIR, service_def.raw_fallback_file)
+    if os.path.exists(fallback_path):
+        return pd.DataFrame(json.load(open(fallback_path)))
+    return pd.DataFrame()
+
+
 def ingest_data(use_aws_live: bool = False):
-    """Main ETL pipeline reading raw billing & metric data into DuckDB."""
+    """Main ETL pipeline reading raw billing & metric data into DuckDB.
+    Per-service tables/columns/fetch logic are driven entirely by
+    config/services/*.yaml via the service registry."""
     os.makedirs(DATA_PROCESSED_DIR, exist_ok=True)
     print("[ETL] Starting Data Ingestion Pipeline...")
 
+    services = load_services()
     aws_conn = AWSNonProdConnector()
     aws_active = use_aws_live or aws_conn.is_aws_authenticated()
 
@@ -99,31 +93,15 @@ def ingest_data(use_aws_live: bool = False):
         if os.path.exists(cur_file):
             df_cur = pd.read_csv(cur_file)
 
-    live_ecs = aws_conn.fetch_ecs_task_metrics() if aws_active else []
-    if live_ecs:
-        df_ecs = pd.DataFrame(live_ecs)
-    else:
-        ecs_file = os.path.join(DATA_RAW_DIR, "ecs_task_metrics.json")
-        df_ecs = pd.DataFrame(json.load(open(ecs_file))) if os.path.exists(ecs_file) else pd.DataFrame()
-
-    live_lambda = aws_conn.fetch_lambda_metrics() if aws_active else []
-    if live_lambda:
-        df_lambda = pd.DataFrame(live_lambda)
-    else:
-        lambda_file = os.path.join(DATA_RAW_DIR, "lambda_metrics.json")
-        df_lambda = pd.DataFrame(json.load(open(lambda_file))) if os.path.exists(lambda_file) else pd.DataFrame()
-
-    live_s3 = aws_conn.fetch_s3_metrics() if aws_active else []
-    if live_s3:
-        df_s3 = pd.DataFrame(live_s3)
-    else:
-        s3_file = os.path.join(DATA_RAW_DIR, "s3_storage_metrics.json")
-        df_s3 = pd.DataFrame(json.load(open(s3_file))) if os.path.exists(s3_file) else pd.DataFrame()
+    service_dataframes = {
+        service_def.service_type: _load_service_dataframe(service_def, aws_conn, aws_active)
+        for service_def in services.values()
+    }
 
     # Now open DuckDB connection and write tables
     con = duckdb.connect(DUCKDB_PATH)
     try:
-        init_db(con)
+        init_db(con, services)
 
         if not df_cur.empty:
             con.execute("DELETE FROM raw_cost_reports;")
@@ -136,38 +114,22 @@ def ingest_data(use_aws_live: bool = False):
             con.unregister("df_cur_temp")
             print(f"  - Loaded {len(df_cur)} records into 'raw_cost_reports'")
 
-        if not df_ecs.empty:
-            con.execute("DELETE FROM ecs_task_metrics;")
-            con.register("df_ecs_temp", df_ecs)
-            con.execute("""
-                INSERT INTO ecs_task_metrics
-                SELECT task_arn, cluster_name, service_name, business_unit, cpu_reserved, memory_reserved, cpu_utilization_max, memory_utilization_max, launch_type, has_security_sidecar
-                FROM df_ecs_temp;
+        for service_def in services.values():
+            df = service_dataframes[service_def.service_type]
+            if df.empty:
+                continue
+            column_names = [f.name for f in service_def.schema_fields]
+            temp_view = f"df_{service_def.table}_temp"
+            con.execute(f"DELETE FROM {service_def.table};")
+            con.register(temp_view, df)
+            select_cols = ", ".join(column_names)
+            con.execute(f"""
+                INSERT INTO {service_def.table}
+                SELECT {select_cols}
+                FROM {temp_view};
             """)
-            con.unregister("df_ecs_temp")
-            print(f"  - Loaded {len(df_ecs)} records into 'ecs_task_metrics'")
-
-        if not df_lambda.empty:
-            con.execute("DELETE FROM lambda_metrics;")
-            con.register("df_lambda_temp", df_lambda)
-            con.execute("""
-                INSERT INTO lambda_metrics
-                SELECT function_arn, function_name, business_unit, memory_allocated_mb, memory_max_used_mb, avg_duration_ms, invocations_count, timeout_seconds
-                FROM df_lambda_temp;
-            """)
-            con.unregister("df_lambda_temp")
-            print(f"  - Loaded {len(df_lambda)} records into 'lambda_metrics'")
-
-        if not df_s3.empty:
-            con.execute("DELETE FROM s3_storage_metrics;")
-            con.register("df_s3_temp", df_s3)
-            con.execute("""
-                INSERT INTO s3_storage_metrics
-                SELECT bucket_name, business_unit, kms_key_arn, is_kms_encrypted, storage_bytes_standard, storage_bytes_glacier, object_count, has_lifecycle_policy, oldest_object_age_days
-                FROM df_s3_temp;
-            """)
-            con.unregister("df_s3_temp")
-            print(f"  - Loaded {len(df_s3)} records into 's3_storage_metrics'")
+            con.unregister(temp_view)
+            print(f"  - Loaded {len(df)} records into '{service_def.table}'")
 
         print("[ETL] Ingestion completed successfully! Database ready at:", DUCKDB_PATH)
     finally:

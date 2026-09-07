@@ -159,6 +159,19 @@ class AWSNonProdConnector:
             ])
         return pd.DataFrame(live_recs)
 
+    def fetch(self, service_def) -> list:
+        """Dispatches to the fetch adapter named in service_def.fetch_adapter."""
+        adapters = {
+            "ecs": self.fetch_ecs_task_metrics,
+            "lambda": self.fetch_lambda_metrics,
+            "s3": self.fetch_s3_metrics,
+        }
+        adapter = adapters.get(service_def.fetch_adapter)
+        if adapter is None:
+            raise ValueError(f"No fetch adapter registered for '{service_def.fetch_adapter}' "
+                              f"(service_type={service_def.service_type})")
+        return adapter()
+
     def fetch_ecs_task_metrics(self) -> list:
         """Fetches live non-prod ECS task definitions and CloudWatch utilization."""
         if not self.is_aws_authenticated():

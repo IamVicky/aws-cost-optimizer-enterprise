@@ -1,0 +1,33 @@
+service_type: ECS-EC2
+table: ecs_task_metrics
+resource_id_template: "{task_arn}"
+fetch_adapter: ecs
+raw_fallback_file: ecs_task_metrics.json
+
+schema:
+  - {name: task_arn, type: VARCHAR, primary_key: true}
+  - {name: cluster_name, type: VARCHAR}
+  - {name: service_name, type: VARCHAR}
+  - {name: business_unit, type: VARCHAR}
+  - {name: cpu_reserved, type: INTEGER}
+  - {name: memory_reserved, type: INTEGER}
+  - {name: cpu_utilization_max, type: DOUBLE}
+  - {name: memory_utilization_max, type: DOUBLE}
+  - {name: launch_type, type: VARCHAR}
+  - {name: has_security_sidecar, type: BOOLEAN}
+
+waste_rule:
+  recommendation_prefix: REC_ECS
+  condition: "cpu_utilization_max < 15.0 or memory_utilization_max < 15.0"
+  savings_formula: "round((cpu_reserved / 1024.0) * 35.0, 2)"
+  derived_fields:
+    suggested_cpu: "max(256, int(cpu_reserved / 4))"
+    suggested_memory: "max(512, int(memory_reserved / 4))"
+  fix_template: "Downsize ECS task definition {service_name} CPU from {cpu_reserved} to {suggested_cpu} units and memory from {memory_reserved} to {suggested_memory} MB while preserving security sidecars."
+
+guardrail_rules:
+  - type: forbidden_patterns
+    match_keywords: ["ECS", "CONTAINER"]
+    patterns: ["REMOVE SIDECAR", "STRIP SIDECAR", "DELETE SECURITY AGENT", "DISABLE AGENT"]
+    compliance_status: REJECTED_SECURITY_SIDECAR_OMISSION
+    rule_id: RULE_ECS_SIDECARS

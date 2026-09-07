@@ -1,0 +1,29 @@
+service_type: S3-Storage
+table: s3_storage_metrics
+resource_id_template: "arn:aws:s3:::{bucket_name}"
+fetch_adapter: s3
+raw_fallback_file: s3_storage_metrics.json
+
+schema:
+  - {name: bucket_name, type: VARCHAR, primary_key: true}
+  - {name: business_unit, type: VARCHAR}
+  - {name: kms_key_arn, type: VARCHAR}
+  - {name: is_kms_encrypted, type: BOOLEAN}
+  - {name: storage_bytes_standard, type: DOUBLE}
+  - {name: storage_bytes_glacier, type: DOUBLE}
+  - {name: object_count, type: INTEGER}
+  - {name: has_lifecycle_policy, type: BOOLEAN}
+  - {name: oldest_object_age_days, type: INTEGER}
+
+waste_rule:
+  recommendation_prefix: REC_S3
+  condition: "has_lifecycle_policy == False and oldest_object_age_days > 90"
+  savings_formula: "round((storage_bytes_standard / 1e12) * 15.0, 2)"
+  fix_template: "Add AWS CloudFormation S3 Lifecycle Rule to transition objects older than 90 days in bucket '{bucket_name}' to Glacier, preserving SSE-KMS encryption with KMS Key '{kms_key_arn}'."
+
+guardrail_rules:
+  - type: forbidden_patterns
+    match_keywords: ["S3", "STORAGE", "KMS"]
+    patterns: ["REMOVE KMS", "DELETE KMS", "DISABLE KMS", "DISABLE ENCRYPTION", "SSE-S3", "UNENCRYPTED"]
+    compliance_status: REJECTED_KMS_MANDATE
+    rule_id: RULE_S3_KMS
